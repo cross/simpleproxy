@@ -13,7 +13,7 @@ AC_CHECK_LIB(socket, connect)
 dnl Checks for header files.
 AC_HEADER_STDC
 AC_HEADER_SYS_WAIT
-AC_CHECK_HEADERS(fcntl.h sys/time.h syslog.h termio.h unistd.h sys/filio.h stropts.h)
+AC_CHECK_HEADERS(fcntl.h sys/time.h syslog.h termio.h unistd.h sys/filio.h stropts.h sys/poll.h)
 
 dnl Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
@@ -24,4 +24,6 @@ AC_TYPE_SIGNAL
 AC_FUNC_VPRINTF
 AC_CHECK_FUNCS(syslog openlog closelog select socket strdup strerror strtol vsnprintf vsprintf)
 
+dnl Allow compilation without IPv6 support
+AC_ARG_ENABLE([inet6], AS_HELP_STRING(--disable-inet6,Disable building with IPv6 support),[AC_DEFINE(NO_INET6,1)],[])
 AC_OUTPUT(Makefile)

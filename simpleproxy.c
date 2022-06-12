@@ -70,6 +70,9 @@
 #if HAVE_FCNTL_H
 #include <fcntl.h>
 #endif
+#if HAVE_SYS_POLL_H
+#include <sys/poll.h>
+#endif
 #if HAVE_TERMIO_H
 # include <termio.h>
 #endif
@@ -97,7 +100,7 @@
 #define SELECT_TIMOEOUT_MSEC 0
 
 static char *SIMPLEPROXY_VERSION = "simpleproxy v3.5 by lord@crocodile.org,vlad@noir.crocodile.org,verylong@noir.crocodile.org,renzo@cs.unibo.it";
-static char *SIMPLEPROXY_USAGE   = "simpleproxy -L <[host:]port> -R <host:port> [-d] [-v] [-V] [-7] [-i] [-u] [-p PID file] [-P <POP3 accounts list file>] [-f cfgfile] [-t tracefile] [-D delay in sec.] [-S <HTTPS proxy host:port> [-a <HTTPS Auth user>:<HTTPS Auth password>] ] [-A  <HTTP Auth user>:<HTTP Auth password>]";
+static char *SIMPLEPROXY_USAGE   = "simpleproxy -L <[host:]port> -R <host:port> [-d] [-v] [-V] [-7] [-i] [-u] [-4 | -6] [-p PID file] [-P <POP3 accounts list file>] [-f cfgfile] [-t tracefile] [-D delay in sec.] [-S <HTTPS proxy host:port> [-a <HTTPS Auth user>:<HTTPS Auth password>] ] [-A  <HTTP Auth user>:<HTTP Auth password>]";
 static char *PROXY_HEADER_FMT = "\r\nProxy-Authorization: Basic %s";
 static char *PROXY_HEADER = "\r\nProxy-Authorization: Basic ";
 static char AUTHMSG[]=
@@ -154,6 +157,8 @@ static int   isStripping        = 0;
 static int   isStartedFromInetd = 0;
 static int   isUsingHTTPSAuth   = 0;
 static int   isHtmlProbe        = 0;
+static int   isIPv4Only         = 0;
+static int   isIPv6Only         = 0;
 static long  Delay              = 0;
 
 static char *HTTPSProxyHost     = nil;
@@ -162,8 +167,10 @@ static char *HTTPSBasicAuthString = nil;
 static char *HTTPAuthHash = nil;
 static char *Tracefile          = nil;
 
-static int  SockFD    = -1,
-    SrcSockFD = -1,
+#define MAX_SOCKETS 5   // Maximum number of local sockets to listen on
+static int  nfds;
+static struct pollfd    SockFDs[MAX_SOCKETS];
+static int  SrcSockFD = -1,
     DstSockFD = -1;
 
 struct lst_record *POPList = nil;
@@ -171,7 +178,6 @@ struct lst_record *POPList = nil;
 int main(int ac, char **av)
 {
     socklen_t    clien;
-    struct sockaddr_in cli_addr, serv_addr;
     int    lportn = -1, rportn = -1;
     char  *lhost = nil, *rhost = nil;
     struct hostent *hp;
@@ -183,7 +189,7 @@ int main(int ac, char **av)
     char  *popfile = nil;
     static struct Cfg *cfg = nil;
     char  *pidfile = nil;
-    int    rsp = 1;
+    int    one = 1;
     char  *https_auth = nil;
     char  *http_auth = nil;
     char  *HTTPSAuthHash = nil;
@@ -191,7 +197,7 @@ int main(int ac, char **av)
     char   hbuf[NI_MAXHOST];
 
     /* Check for the arguments, and overwrite values from cfg file */
-    while((c = getopt(ac, av, "iVv7dhuL:R:H:f:p:P:D:S:s:a:A:t:")) != -1)
+    while((c = getopt(ac, av, "iVv7dhu46L:R:H:f:p:P:D:S:s:a:A:t:")) != -1)
         switch (c)
         {
         case 'v':
@@ -250,7 +256,7 @@ int main(int ac, char **av)
                     if(tmp && !popfile)
                         replace_string(&popfile, tmp);
                     tmp = cfgfind("LocalHost", cfg, 0);
-                    if(tmp && !rhost)
+                    if(tmp && !lhost)
                         parse_host_port(tmp, &lhost, &lportn);
                     tmp = cfgfind("RemoteHost", cfg, 0);
                     if(tmp && !rhost)
@@ -315,6 +321,24 @@ int main(int ac, char **av)
         case 't':
             replace_string(&Tracefile, optarg);
             break;
+// XXX NO_INET6
+        case '4':
+            if (isIPv6Only)
+            {
+                fprintf(stderr, "Error: Only one of -4 and -6 are allowed.\n");
+                errflg++;
+            }
+            isIPv4Only = 1;
+            break;
+        case '6':
+            if (isIPv6Only)
+            {
+                fprintf(stderr, "Error: Only one of -4 and -6 are allowed.\n");
+                errflg++;
+            }
+            isIPv6Only = 1;
+            break;
+// XXX end NO_INET6
         default:
             errflg++;
         }
@@ -377,6 +401,13 @@ int main(int ac, char **av)
 
     if (!isStartedFromInetd)
     {
+#ifdef NO_INET6
+        struct sockaddr_in cli_addr, serv_addr;
+#else
+        struct sockaddr_storage cli_addr, serv_addr;
+#endif
+        nfds = 0;
+
         /* Let's become a daemon */
         if(isDaemon)
             daemon_start();
@@ -384,7 +415,8 @@ int main(int ac, char **av)
         if(pidfile)
             write_pid(pidfile);
 
-        if((SockFD = socket(AF_INET,SOCK_STREAM,0)) < 0)
+#ifdef NO_INET6
+        if((SockFDs[nfds].fd = socket(AF_INET,SOCK_STREAM,0)) < 0)
         {
             logmsg(LOG_ERR,"Error creating socket.");
             fatal();
@@ -395,89 +427,225 @@ int main(int ac, char **av)
         serv_addr.sin_addr.s_addr = ((lhost && *lhost)? get_hostaddr(lhost): htonl(INADDR_ANY));
         serv_addr.sin_port = htons(lportn);
 
-        if (setsockopt(SockFD, SOL_SOCKET, SO_REUSEADDR, (void*)&rsp, sizeof(rsp)))
+        if (setsockopt(SockFDs[nfds].fd, SOL_SOCKET, SO_REUSEADDR, (void*)&one, sizeof(one)))
             logmsg(LOG_ERR,"Error setting socket options");
 
-        if (bind(SockFD, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+        if (bind(SockFDs[nfds].fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
         {
-            logmsg(LOG_ERR,"Error binding socket.");
+            logmsg(LOG_ERR,"Error binding socket: %s", strerror(errno));
             fatal();
         }
 
-        logmsg(LOG_INFO,"Waiting for connections.");
+	logmsg(LOG_INFO,"Waiting for connections.");
 
-        if (listen(SockFD,5) < 0)
+	if (listen(SockFDs[nfds].fd, 5) < 0)
+	{
+	    logmsg(LOG_ERR,"Error listening socket: %s", strerror(errno));
+	    fatal();
+	}
+#else
+        /* Listen on IPv6 and IPv4 addresses */
+        struct addrinfo *ai, *ai_iter;
+        struct addrinfo hints;
+
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = PF_UNSPEC;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_PASSIVE | AI_ADDRCONFIG | AI_NUMERICSERV;
+        char portstr[6];
+        sprintf(portstr, "%u", lportn);
+        logmsg(LOG_DEBUG,"Calling getaddrinfo(NULL,%s)", portstr);
+        int e = getaddrinfo(NULL, portstr, &hints, &ai);
+        logmsg(LOG_DEBUG,"got %d from getaddrinfo", e);
+        if (e)
         {
-            logmsg(LOG_ERR,"Error listening socket: %s", strerror(errno));
-            fatal();
+            logmsg(LOG_ERR,"Can't getaddrinfo - %s ", gai_strerror(e));
+            return -1;
         }
+        for (nfds = 0, ai_iter = ai ; ai_iter != NULL && nfds < MAX_SOCKETS; ai_iter = ai_iter->ai_next, ++nfds )
+        {
+            if (isIPv4Only && ai_iter->ai_family != AF_INET)
+            {
+                logmsg(LOG_DEBUG, "Found non-AF_INET address, skipping it by request.");
+                nfds--;
+                continue;
+            }
+            if (isIPv6Only && ai_iter->ai_family != AF_INET6)
+            {
+                logmsg(LOG_DEBUG, "Found non-AF_INET6 address, skipping it by request.");
+                nfds--;
+                continue;
+            }
+
+
+            logmsg(LOG_DEBUG,"getaddrinfo: family %u, next %p", ai_iter->ai_family, ai_iter->ai_next);
+            logmsg(LOG_DEBUG,"           : socktype %x, protocol %x, addrlen %u", ai_iter->ai_socktype, ai_iter->ai_protocol, ai_iter->ai_addrlen);
+            if (ai_iter->ai_family == AF_INET) {
+                struct sockaddr_in *sin = ai_iter->ai_addr;
+                logmsg(LOG_DEBUG,"           : addr %s, port %u", inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
+            } else {
+                struct sockaddr_in6 *sin6 = ai_iter->ai_addr;
+                char localaddr[64];
+                inet_ntop(sin6->sin6_family, &sin6->sin6_addr, localaddr, sizeof(localaddr));
+                logmsg(LOG_DEBUG,"           : addr %s, port %u", localaddr, ntohs(sin6->sin6_port));
+            }
+            if((SockFDs[nfds].fd = socket(ai_iter->ai_family, ai_iter->ai_socktype, ai_iter->ai_protocol)) < 0)
+            {
+                logmsg(LOG_ERR,"Error creating socket.");
+                fatal();
+            }
+            logmsg(LOG_DEBUG,"Created socket[%d], fd is %d", nfds, SockFDs[nfds].fd);
+
+	    if (setsockopt(SockFDs[nfds].fd, SOL_SOCKET, SO_REUSEADDR, (void*)&one, sizeof(one)))
+		logmsg(LOG_ERR,"Error setting socket options");
+            // Make sure IPv6 sockets can also accept IPv4 connections...
+            // TODO:  Is this for FreeBSD only?
+            // XXX: This makes the whole structure here unneeded.  I'm going
+            // to ditch this effort and start again...  :-/
+            if (ai_iter->ai_family == AF_INET6)
+            {
+                int zero = 0;
+                if (setsockopt(SockFDs[nfds].fd, IPPROTO_IPV6, IPV6_V6ONLY, (void*)&zero, sizeof(zero)))
+                    logmsg(LOG_ERR,"Error setting IPV6 socket option: %s", strerror(errno));
+            }
+
+            void *aptr;
+            if (ai_iter->ai_family == AF_INET6)
+                aptr = &(((struct sockaddr_in6 *)ai_iter->ai_addr)->sin6_addr);
+            else
+            {
+                struct sockaddr_in *sin = ai_iter->ai_addr;
+//                aptr = &(((struct sockaddr_in *)ai_iter->ai_addr)->sin_addr);
+                aptr = &sin->sin_addr;
+//                sin->sin_port = htons(ntohs(sin->sin_port)+1);
+            }
+            logmsg(LOG_DEBUG,"Going to bind socket #%d (fd %d): addr %s (len %d)",nfds, SockFDs[nfds].fd, inet_ntop(ai_iter->ai_family, aptr, hbuf, sizeof(hbuf)), ai_iter->ai_addrlen);
+	    if (bind(SockFDs[nfds].fd, ai_iter->ai_addr, ai_iter->ai_addrlen) < 0)
+	    {
+		logmsg(LOG_DEBUG,"Error binding socket (%d): errno %d, EADDRINUSE is %d", nfds, errno, EADDRINUSE);
+		logmsg(LOG_ERR,"Error binding socket (%d): %s", nfds, strerror(errno));
+		fatal();
+	    }
+#if 1
+	    else
+	    {
+		logmsg(LOG_INFO,"Waiting for connections (%d).", nfds);
+
+		if (listen(SockFDs[nfds].fd,5) < 0)
+		{
+		    logmsg(LOG_ERR,"Error listening socket: %s", strerror(errno));
+		    fatal();
+		}
+	    }
+#endif
+	    freeaddrinfo(ai);
+	}
+#endif
 
         while (1)
         {
             clien = sizeof(cli_addr);
 
-            SrcSockFD = accept(SockFD,(struct sockaddr *)&cli_addr, &clien);
+            logmsg(LOG_DEBUG,"Calling poll() for %d FDs in SockFDs", nfds);
+	    int n = poll (SockFDs, nfds, -1);
+	    if (n == 0)
+	    {
+		continue;
+	    }
+	    else if (n < 0)
+	    {
+		logmsg(LOG_ERR,"Error polling sockets: %s", strerror(errno));
+		/* Safe to try again here?  Should check for loop... */
+		continue;
+	    }
+            logmsg(LOG_DEBUG,"poll() returned %d", n);
 
-            if(SrcSockFD < 0)
-            {
-                if (errno == EINTR || errno == ECHILD) /* Interrupt after SIGCHLD */
-                    continue;
-                logmsg(LOG_ERR, "accept error - %s", strerror(errno));
-                fatal();
-            }
+	    /* Process the one or more FDs that poll() says is ready */
+	    for (int i = 0 ; i < nfds ; i++)
+	    {
+                logmsg(LOG_DEBUG,"poll() returned %d", n);
+		if (SockFDs[i].revents & POLLIN)
+		{
+		    SrcSockFD = accept(SockFDs[i].fd,(struct sockaddr *)&cli_addr, &clien);
 
-            signal(SIGCHLD, child_dead);
+		    if(SrcSockFD < 0)
+		    {
+			if (errno == EINTR || errno == ECHILD) /* Interrupt after SIGCHLD */
+			    continue;
+			logmsg(LOG_ERR, "accept error - %s", strerror(errno));
+			fatal();
+		    }
+#ifndef NO_INET6
+		    logmsg(LOG_INFO, "Accepted a connection, client family is %d", cli_addr.ss_family);
+#endif
 
-            switch (fork())
-            {
-            case -1: /* fork error */
-                logmsg(LOG_ERR,"fork error - %s", strerror(errno));
-                break;
+		    signal(SIGCHLD, child_dead);
 
-            case 0: /* Child */
-                if (getnameinfo((const struct sockaddr *) &cli_addr, len,
-                                hbuf, sizeof(hbuf), NULL, 0, 0) == 0)
-                    client_name = strdup(hbuf);
-                else
-                    client_name = inet_ntoa(cli_addr.sin_addr);
+		    switch (fork())
+		    {
+		    case -1: /* fork error */
+			logmsg(LOG_ERR,"fork error - %s", strerror(errno));
+			break;
 
-                /*
-                 * I don't know is that a bug, but on Irix 6.2 parent
-                 * process will not be able to accept any new connection
-                 * if SockFD is closed here.                  Vlad
-                 */
+		    case 0: /* Child */
+			logmsg(LOG_INFO,"in child");
+#if 1
+			if (getnameinfo((const struct sockaddr *) &cli_addr, clien,
+					hbuf, sizeof(hbuf), NULL, 0, 0) != 0)
+			    (void)getnameinfo((const struct sockaddr *) &cli_addr, clien,
+					      hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
+#else
+			int e = getnameinfo((const struct sockaddr *) &cli_addr, addr_len, hbuf, sizeof(hbuf), NULL, 0, 0);
+			if (e != 0)
+			{
+			    logmsg(LOG_WARNING, "getnameinfo failed: %s", gai_strerror(e));
+			    e = getnameinfo((const struct sockaddr *) &cli_addr, addr_len,
+					    hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
+			    logmsg(LOG_INFO, "getnameinfo numerichost returned %d (%s)", e, gai_strerror(e));
+			}
+#endif
+			client_name = strdup(hbuf);
 
-                /* (void)shutdown(SockFD,2); */
-                /* (void)close(SockFD);      */
+			/*
+			 * I don't know is that a bug, but on Irix 6.2 parent
+			 * process will not be able to accept any new connection
+			 * if SockFD is closed here.                  Vlad
+			 */
 
-                /* Process connection */
+			/* (void)shutdown(SockFD,2); */
+			/* (void)close(SockFD);      */
 
-                logmsg(LOG_NOTICE,
-                       "Connect from %s (%s:%d->%s:%d)",
-                       client_name,
-                       ((lhost && *lhost)? lhost: "ANY"),     lportn,
-                       (rhost && *rhost)? rhost: "localhost", rportn);
+			/* Process connection */
 
-                if (process_remote(rhost, rportn, client_name))
-                    fatal();
+			logmsg(LOG_NOTICE,
+			       "Connect from %s (%s:%d->%s:%d)",
+			       client_name,
+			       ((lhost && *lhost)? lhost: "ANY"),     lportn,
+			       (rhost && *rhost)? rhost: "localhost", rportn);
 
-                logmsg(LOG_NOTICE,
-                       "Connect from %s (%s:%d->%s:%d) closed",
-                       client_name,
-                       ((lhost && *lhost)? lhost: "ANY"), lportn,
-                       (rhost && *rhost)? rhost: "localhost", rportn);
+			if (process_remote(rhost, rportn, client_name))
+			    fatal();
 
-                shutdown(SrcSockFD, 2);
-                close(SrcSockFD);
-                SrcSockFD = -1;
-                closelog();
-                return 0; // Exit
-            default:
-                /* Parent */
-                close(SrcSockFD);
-                SrcSockFD = -1;
-            }
-        }
+			logmsg(LOG_NOTICE,
+			       "Connect from %s (%s:%d->%s:%d) closed",
+			       client_name,
+			       ((lhost && *lhost)? lhost: "ANY"), lportn,
+			       (rhost && *rhost)? rhost: "localhost", rportn);
+
+			shutdown(SrcSockFD, 2);
+			close(SrcSockFD);
+			SrcSockFD = -1;
+			closelog();
+			return 0; // Exit
+		    default:
+			/* Parent */
+			close(SrcSockFD);
+			SrcSockFD = -1;
+		    }
+		}
+	    }
+	}
     }
     else
     {
@@ -1108,7 +1276,11 @@ int open_remote(const char *rhost, int rportn, const char *src_name)
 {
     const char        *dest_host;
     int                dest_port;
+#ifdef NO_INET6
     struct sockaddr_in remote_addr;
+#else
+    struct sockaddr_storage remote_addr;
+#endif
     int                DstSockFD;
 
 
@@ -1124,14 +1296,35 @@ int open_remote(const char *rhost, int rportn, const char *src_name)
     }
 
     if (!(dest_host && *dest_host))
-        dest_host = "127.0.0.1";
+        dest_host = "localhost";
 
+#ifdef NO_INET6
     if ((DstSockFD = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+#else
+    struct addrinfo *ai;
+    struct addrinfo hints;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = PF_UNSPEC;
+    hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[6];
+    sprintf(portstr, "%u", dest_port);
+    logmsg(LOG_INFO, "calling getaddrinfo(%s, %s)", dest_host, portstr);
+    int e = getaddrinfo(dest_host, portstr, &hints, &ai);
+    if (e)
+    {
+        logmsg(LOG_ERR,"Can't getaddrinfo - %s ", gai_strerror(e));
+        return -1;
+    }
+    if ((DstSockFD = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1)
+#endif
     {
         logmsg(LOG_ERR,"Can't create socket - %s ", strerror(errno));
         return -1;
     }
 
+#ifdef NO_INET6
     remote_addr.sin_family      = AF_INET;
     remote_addr.sin_port        = htons(dest_port);
     remote_addr.sin_addr.s_addr = get_hostaddr(dest_host);
@@ -1143,10 +1336,14 @@ int open_remote(const char *rhost, int rportn, const char *src_name)
     }
 
     if (connect(DstSockFD, (struct sockaddr *) &remote_addr, sizeof(remote_addr)))
+#else
+    if (connect(DstSockFD, ai->ai_addr, ai->ai_addrlen))
+#endif
     {
         logmsg(LOG_ERR,"connect error to %s:%d - %s", dest_host, dest_port, strerror(errno));
         return -1;
     }
+    logmsg(LOG_INFO, "connected to remote, returning fd...");
 
     if (HTTPSProxyHost && https_connect(DstSockFD, rhost, rportn))
         return -1;
@@ -1270,10 +1467,12 @@ static void ctrlc(int s)
 {
     logmsg(LOG_INFO,"Interrupted... Shutting down connections");
 
-    if(SockFD    !=-1)
+    for (int i = 0 ; i < nfds ; i++)
     {
-/*  (void)shutdown(SockFD,2); */
-        (void)close(SockFD   );
+	if(SockFDs[i].fd != -1)
+	{
+	    (void)close(SockFDs[i].fd);
+	}
     }
     if(SrcSockFD !=-1)
     {
@@ -1321,8 +1520,12 @@ void replace_string(char **dst, const char *src)
 
 void fatal()
 {
-    if (SockFD != -1)
-        close(SockFD);
+        // TODO: Iterate SockFDs and close them
+    for (int i = 0 ; i < nfds ; i++)
+    {
+	if (SockFDs[i].fd != -1)
+	    close(SockFDs[i].fd);
+    }
     if (SrcSockFD != -1)
         close(SrcSockFD);
     if (DstSockFD != -1)
@@ -1399,7 +1602,11 @@ static void trace(int fd, char *buf, int siz)
     char peer_name[NI_MAXHOST+16]; /* 16 bytes from column and port number */
     char trace_header[256];
     int trace_header_len;
+#ifdef NO_INET6
     struct sockaddr_in peer_addr;
+#else
+    struct sockaddr_storage peer_addr;
+#endif
     socklen_t peer_addr_len = sizeof(peer_addr);
     struct hostent *peer_host;
     ssize_t unused_bytes_written;
@@ -1417,15 +1624,26 @@ static void trace(int fd, char *buf, int siz)
         {
             char hbuf[NI_MAXHOST];
             char *client_host_name;
+            int client_port;
 
-            if(getnameinfo((const struct sockaddr *) &peer_addr, peer_addr_len,
-                           hbuf, sizeof(hbuf), NULL, 0, 0) == 0)
-                client_host_name = hbuf;
+            if (getnameinfo((const struct sockaddr *) &peer_addr, peer_addr_len,
+                            hbuf, sizeof(hbuf), NULL, 0, 0) != 0)
+                (void)getnameinfo((const struct sockaddr *) &peer_addr, peer_addr_len,
+                                  hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
+            client_host_name = strdup(hbuf);
+#ifdef NO_INET6
+            client_port = ntohs(peer_addr.sin_port);
+#else
+            if (peer_addr.ss_family == AF_INET)
+                client_port = ntohs(((struct sockaddr_in*)&peer_addr)->sin_port);
+            else if (peer_addr.ss_family == AF_INET6)
+                client_port = ntohs(((struct sockaddr_in6*)&peer_addr)->sin6_port);
             else
-                client_host_name = inet_ntoa(peer_addr.sin_addr);
+                client_port = -1;
+#endif
 
             snprintf(peer_name, sizeof(peer_name)  - 1, "%s:%i",
-                     client_host_name, ntohs(peer_addr.sin_port));
+                     client_host_name, client_port);
         }
         else
             strcpy(peer_name, "unknown source");
@@ -1440,3 +1658,4 @@ static void trace(int fd, char *buf, int siz)
         close(tfd);
     }
 }
+/* vim:set et: */
