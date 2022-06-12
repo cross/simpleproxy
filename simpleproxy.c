@@ -97,7 +97,11 @@
 #define SELECT_TIMOEOUT_MSEC 0
 
 static char *SIMPLEPROXY_VERSION = "simpleproxy v3.5 by lord@crocodile.org,vlad@noir.crocodile.org,verylong@noir.crocodile.org,renzo@cs.unibo.it";
+#ifdef NO_INET6
 static char *SIMPLEPROXY_USAGE   = "simpleproxy -L <[host:]port> -R <host:port> [-d] [-v] [-V] [-7] [-i] [-u] [-p PID file] [-P <POP3 accounts list file>] [-f cfgfile] [-t tracefile] [-D delay in sec.] [-S <HTTPS proxy host:port> [-a <HTTPS Auth user>:<HTTPS Auth password>] ] [-A  <HTTP Auth user>:<HTTP Auth password>]";
+#else
+static char *SIMPLEPROXY_USAGE   = "simpleproxy -L <[host:]port> -R <host:port> [-d] [-v] [-V] [-7] [-i] [-u] [-4 | -6] [-p PID file] [-P <POP3 accounts list file>] [-f cfgfile] [-t tracefile] [-D delay in sec.] [-S <HTTPS proxy host:port> [-a <HTTPS Auth user>:<HTTPS Auth password>] ] [-A  <HTTP Auth user>:<HTTP Auth password>]";
+#endif
 static char *PROXY_HEADER_FMT = "\r\nProxy-Authorization: Basic %s";
 static char *PROXY_HEADER = "\r\nProxy-Authorization: Basic ";
 static char AUTHMSG[]=
@@ -154,6 +158,10 @@ static int   isStripping        = 0;
 static int   isStartedFromInetd = 0;
 static int   isUsingHTTPSAuth   = 0;
 static int   isHtmlProbe        = 0;
+#ifndef NO_INET6
+static int   isIPv4Only         = 0;
+static int   isIPv6Only         = 0;
+#endif
 static long  Delay              = 0;
 
 static char *HTTPSProxyHost     = nil;
@@ -171,7 +179,6 @@ struct lst_record *POPList = nil;
 int main(int ac, char **av)
 {
     socklen_t    clien;
-    struct sockaddr_in cli_addr, serv_addr;
     int    lportn = -1, rportn = -1;
     char  *lhost = nil, *rhost = nil;
     struct hostent *hp;
@@ -183,7 +190,8 @@ int main(int ac, char **av)
     char  *popfile = nil;
     static struct Cfg *cfg = nil;
     char  *pidfile = nil;
-    int    rsp = 1;
+    int    one = 1;
+    int    zero = 0;
     char  *https_auth = nil;
     char  *http_auth = nil;
     char  *HTTPSAuthHash = nil;
@@ -191,7 +199,11 @@ int main(int ac, char **av)
     char   hbuf[NI_MAXHOST];
 
     /* Check for the arguments, and overwrite values from cfg file */
+#ifdef NO_INET6
     while((c = getopt(ac, av, "iVv7dhuL:R:H:f:p:P:D:S:s:a:A:t:")) != -1)
+#else
+    while((c = getopt(ac, av, "iVv7dhu46L:R:H:f:p:P:D:S:s:a:A:t:")) != -1)
+#endif
         switch (c)
         {
         case 'v':
@@ -315,6 +327,30 @@ int main(int ac, char **av)
         case 't':
             replace_string(&Tracefile, optarg);
             break;
+#ifndef NO_INET6
+        case '4':
+            if (isIPv6Only)
+            {
+                fprintf(stderr, "Error: Only one of -4 and -6 are allowed.\n");
+                errflg++;
+            }
+            else
+            {
+                isIPv4Only = 1;
+            }
+            break;
+        case '6':
+            if (isIPv4Only)
+            {
+                fprintf(stderr, "Error: Only one of -4 and -6 are allowed.\n");
+                errflg++;
+            }
+            else
+            {
+                isIPv6Only = 1;
+            }
+            break;
+#endif
         default:
             errflg++;
         }
@@ -377,6 +413,12 @@ int main(int ac, char **av)
 
     if (!isStartedFromInetd)
     {
+#ifdef NO_INET6
+        struct sockaddr_in cli_addr, serv_addr;
+#else
+        struct sockaddr_storage cli_addr, serv_addr;
+#endif
+
         /* Let's become a daemon */
         if(isDaemon)
             daemon_start();
@@ -384,23 +426,80 @@ int main(int ac, char **av)
         if(pidfile)
             write_pid(pidfile);
 
+#if NO_INET6
         if((SockFD = socket(AF_INET,SOCK_STREAM,0)) < 0)
+#else
+        if (isIPv4Only)
+        {
+            SockFD = socket(AF_INET,SOCK_STREAM,0);
+            logmsg(LOG_DEBUG,"Created an IPv4 socket (fd %d)",SockFD);
+        }
+        else
+        {
+            SockFD = socket(AF_INET6,SOCK_STREAM,0);
+            logmsg(LOG_DEBUG,"Created an IPv6 socket (fd %d)",SockFD);
+        }
+        if (SockFD < 0)
+#endif
         {
             logmsg(LOG_ERR,"Error creating socket.");
             fatal();
         }
 
+        if (setsockopt(SockFD, SOL_SOCKET, SO_REUSEADDR, (void*)&one, sizeof(one)))
+            logmsg(LOG_ERR,"Error setting socket options");
+
         memset((void *)&serv_addr, 0, sizeof(serv_addr));
+#ifdef NO_INET6
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_addr.s_addr = ((lhost && *lhost)? get_hostaddr(lhost): htonl(INADDR_ANY));
         serv_addr.sin_port = htons(lportn);
-
-        if (setsockopt(SockFD, SOL_SOCKET, SO_REUSEADDR, (void*)&rsp, sizeof(rsp)))
-            logmsg(LOG_ERR,"Error setting socket options");
-
-        if (bind(SockFD, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+        len = sizeof(serv_addr);
+#else
+        if (isIPv4Only)
         {
-            logmsg(LOG_ERR,"Error binding socket.");
+            ((struct sockaddr_in *)&serv_addr)->sin_family = AF_INET;
+            ((struct sockaddr_in *)&serv_addr)->sin_len = sizeof(struct sockaddr_in);
+            ((struct sockaddr_in *)&serv_addr)->sin_addr.s_addr = ((lhost && *lhost) ? get_hostaddr(lhost) : htonl(INADDR_ANY));
+            ((struct sockaddr_in *)&serv_addr)->sin_port = htons(lportn);
+        }
+        else
+        {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&serv_addr;
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_len = sizeof(struct sockaddr_in6);
+            // TODO: Add support for getaddrinfo() if lhost
+            if (lhost && *lhost) { logmsg(LOG_ERR,"ipv6 hostaddr binding doesn't work yet"); fatal();}
+            //serv_addr.sin_addr.s_addr = ((lhost && *lhost) ? get_hostaddr(lhost) : htonl(INADDR_ANY));
+            sin6->sin6_addr = in6addr_any;
+            sin6->sin6_port = htons(lportn);
+            int v6only;
+            if (isIPv6Only)
+            {
+                v6only = one;
+            }
+            else
+            {
+                v6only = zero;
+            }
+            if (setsockopt(SockFD, IPPROTO_IPV6, IPV6_V6ONLY, (void *)&v6only, sizeof(v6only)))
+                logmsg(LOG_ERR, "Error setting IPV6 socket option: %s", strerror(errno));
+        }
+
+        len = serv_addr.ss_len;
+/*
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&serv_addr;
+
+        logmsg(LOG_DEBUG,"serv_addr: family %u, len %u", serv_addr.ss_family, serv_addr.ss_len);
+//        logmsg(LOG_DEBUG,"           : socktype %x, protocol %x, addrlen %u", sin6->sin, ai_iter->ai_protocol, ai_iter->ai_addrlen);
+        char localaddr[64];
+        inet_ntop(sin6->sin6_family, &sin6->sin6_addr, localaddr, sizeof(localaddr));
+        logmsg(LOG_DEBUG, "           : addr %s, port %u", localaddr, ntohs(sin6->sin6_port));
+*/
+#endif
+        if (bind(SockFD, (struct sockaddr *)&serv_addr, len) < 0)
+        {
+            logmsg(LOG_ERR,"Error binding socket: %s",strerror(errno));
             fatal();
         }
 
@@ -439,7 +538,27 @@ int main(int ac, char **av)
                                 hbuf, sizeof(hbuf), NULL, 0, 0) == 0)
                     client_name = strdup(hbuf);
                 else
+                {
+#ifdef NO_INET6                
                     client_name = inet_ntoa(cli_addr.sin_addr);
+#else
+                    void *addrp;
+                    char namebuf[INET6_ADDRSTRLEN];
+                    if (cli_addr.ss_family == AF_INET)
+                    {
+                        addrp = &((struct sockaddr_in*)&cli_addr)->sin_addr;
+                    }
+                    else
+                    {
+                        addrp = &((struct sockaddr_in6*)&cli_addr)->sin6_addr;
+                    }
+                    if (inet_ntop(cli_addr.ss_family, addrp, namebuf, sizeof(namebuf)) != NULL)
+                    {
+                        // Could inet_ntop fail here?  Why?
+                        client_name = strdup(namebuf);
+                    }
+#endif                    
+                }
 
                 /*
                  * I don't know is that a bug, but on Irix 6.2 parent
@@ -584,7 +703,7 @@ void pass_all( int fd, int client )
 static int get_hostaddr(const char *name)
 {
     struct hostent *he;
-    int             res = -1;
+    in_addr_t       res = -1;
     int             a1,a2,a3,a4;
 
     if (sscanf(name,"%d.%d.%d.%d",&a1,&a2,&a3,&a4) == 4)
@@ -592,7 +711,7 @@ static int get_hostaddr(const char *name)
     else
     {
         he = gethostbyname(name);
-        if (he)
+        if (he && he->h_addrtype == AF_INET)
             memcpy(&res , he->h_addr , he->h_length);
     }
     return res;
