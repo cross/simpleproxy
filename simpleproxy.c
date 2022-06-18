@@ -535,27 +535,49 @@ int main(int ac, char **av)
 
             case 0: /* Child */
                 if (getnameinfo((const struct sockaddr *) &cli_addr, len,
-                                hbuf, sizeof(hbuf), NULL, 0, 0) == 0)
+                                hbuf, sizeof(hbuf), NULL, 0, NI_NAMEREQD) == 0)
                     client_name = strdup(hbuf);
                 else
                 {
 #ifdef NO_INET6                
                     client_name = inet_ntoa(cli_addr.sin_addr);
 #else
-                    void *addrp;
                     char namebuf[INET6_ADDRSTRLEN];
+                    char *name = namebuf;
                     if (cli_addr.ss_family == AF_INET)
                     {
-                        addrp = &((struct sockaddr_in*)&cli_addr)->sin_addr;
+                        client_name = inet_ntoa(((struct sockaddr_in*)&cli_addr)->sin_addr);
+                        logmsg(LOG_DEBUG,"AF_INET address, inet_ntoa returned %s", client_name);
                     }
-                    else
+                    else if (cli_addr.ss_family == AF_INET6)
                     {
-                        addrp = &((struct sockaddr_in6*)&cli_addr)->sin6_addr;
+                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6*)&cli_addr;
+                        /* Special case IPv4 mapped addresses, to show normal IPv4 format */
+                        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr))
+                        {
+                            client_name = inet_ntoa(*((struct in_addr*)(sin6->sin6_addr.s6_addr+12)));
+                            logmsg(LOG_DEBUG,"AF_INET6 V4 mapped address, inet_ntoa returned %s", client_name);
+                        }
+                        else
+                        {
+                            if (inet_ntop(cli_addr.ss_family, &sin6->sin6_addr, namebuf, sizeof(namebuf)) == NULL)
+                            {
+                                // This is unlikely to fail, but just in case...
+                                logmsg(LOG_WARNING, "Unable to form name from INET6 address: %s", strerror(errno));
+                                client_name = "N/A";
+                            }
+                            else
+                            {
+                                client_name = strdup(namebuf);
+                                logmsg(LOG_DEBUG,"AF_INET6 address, inet_ntop returned %s", client_name);
+                                // TODO: I suspect memory will be leaked, fix that...
+                            }
+                        }
                     }
-                    if (inet_ntop(cli_addr.ss_family, addrp, namebuf, sizeof(namebuf)) != NULL)
+                    else // Just in case.  No idea why this would be hit.
                     {
-                        // Could inet_ntop fail here?  Why?
-                        client_name = strdup(namebuf);
+                        logmsg(LOG_WARNING,"Unknown address family %d", cli_addr.ss_family);
+                        client_name = "Unknown";
                     }
 #endif                    
                 }
